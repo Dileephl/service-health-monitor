@@ -63,3 +63,88 @@ jobs:
       - name: Publish image
         if: github.event_name != 'pull_request'
         run: docker push "${IMAGE}:${GITHUB_SHA}"
+
+  deploy:
+    name: Update deployment repository
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    concurrency:
+      group: health-monitor-backend-deployment
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check this is still the latest main commit
+        id: latest
+        shell: bash
+        run: |
+          latest_sha=$(git ls-remote https://github.com/Dileephl/service-health-monitor.git refs/heads/main | cut -f1)
+          if [ "$latest_sha" = "$GITHUB_SHA" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Skipping deployment of an older commit."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout deployment repository
+        if: steps.latest.outputs.deploy == 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: Dileephl/service-health-monitor-deploy
+          ref: main
+          token: ${{ secrets.DEPLOY_REPO_TOKEN }}
+          path: deploy
+
+      - name: Update image and application version
+        if: steps.latest.outputs.deploy == 'true'
+        working-directory: deploy
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("apps/backend/deployment.yaml")
+          text = path.read_text()
+          sha = os.environ["GITHUB_SHA"]
+
+          text, image_count = re.subn(
+              r"(?m)^(\s*image:\s*)ghcr\.io/dileephl/service-health-monitor-backend:[^\s]+",
+              lambda m: m.group(1) + "ghcr.io/dileephl/service-health-monitor-backend:" + sha,
+              text,
+          )
+
+          text, version_count = re.subn(
+              r"(?m)^(\s*-\s*name:\s*APP_VERSION\s*\n\s*value:\s*)[^\n]+",
+              lambda m: m.group(1) + '"' + sha + '"',
+              text,
+          )
+
+          if image_count != 1 or version_count != 1:
+              raise SystemExit("Expected exactly one image and one APP_VERSION; check deployment.yaml")
+
+          path.write_text(text)
+          PY
+
+      - name: Commit and push deployment update
+        if: steps.latest.outputs.deploy == 'true'
+        working-directory: deploy
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add apps/backend/deployment.yaml
+
+          if git diff --cached --quiet; then
+            echo "Deployment already references this version."
+          else
+            git commit -m "Deploy backend ${GITHUB_SHA}"
+            git push origin main
+          fi
